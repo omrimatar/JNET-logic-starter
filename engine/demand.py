@@ -12,6 +12,15 @@ Rules (V20.0):
    add IsInactive for every stage one level BELOW the source (from_level + 1).
 4. Empty → return '' (never write 'true').
 
+Detector expressions support Python-style boolean syntax:
+  - Single:  'Pc'
+  - OR:      'D6 or D10'
+  - AND:     'D2 and D5'
+  - Complex: '(D2 or Pa) and not Pb'
+
+IsActive transforms the expression directly.
+IsInactive applies De Morgan's law recursively (or↔and swapped, not flipped).
+
 Example — B, B1, B2 are siblings (priorities 1, 2, 3) with detectors Pc, Phg, none:
   A → B  : IsActive(Pc)
   A → B1 : IsActive(Phg) and IsInactive(Pc)
@@ -20,8 +29,66 @@ Example — B, B1, B2 are siblings (priorities 1, 2, 3) with detectors Pc, Phg, 
 """
 
 from __future__ import annotations
+import ast as _ast
+import re as _re
 from engine.parser import StageProps
 
+
+# ── Boolean expression transformer ────────────────────────────────────────────
+
+def _transform_expr(expr: str, mode: str) -> str:
+    """
+    Parse a boolean detector expression and transform into JNET function calls.
+
+    mode='active'   → IsActive(X) for atoms; 'not X' → IsInactive(X)
+    mode='inactive' → IsInactive(X) for atoms; De Morgan applied (swap and/or, flip not)
+
+    Examples (active):
+      'Pc'                     → 'IsActive(Pc)'
+      'D6 or D10'              → 'IsActive(D6) or IsActive(D10)'
+      '(D2 or Pa) and not Pb'  → '(IsActive(D2) or IsActive(Pa)) and IsInactive(Pb)'
+
+    Examples (inactive / De Morgan):
+      'Pc'                     → 'IsInactive(Pc)'
+      'D6 or D10'              → 'IsInactive(D6) and IsInactive(D10)'
+      '(D2 or Pa) and not Pb'  → '(IsInactive(D2) and IsInactive(Pa)) or IsActive(Pb)'
+    """
+    # Normalise keyword case: AND/OR/NOT → and/or/not (preserves detector names)
+    expr = _re.sub(r'\b(and|or|not)\b', lambda m: m.group(0).lower(), expr.strip(),
+                   flags=_re.IGNORECASE)
+    try:
+        tree = _ast.parse(expr, mode='eval')
+    except SyntaxError as e:
+        raise ValueError(f"Invalid detector expression '{expr}': {e}") from e
+    return _node_to_jnet(tree.body, mode, parent_is_boolop=False)
+
+
+def _node_to_jnet(node, mode: str, parent_is_boolop: bool) -> str:
+    """Recursively convert an AST node to a JNET logic string."""
+    if isinstance(node, _ast.Name):
+        fn = 'IsActive' if mode == 'active' else 'IsInactive'
+        return f"{fn}({node.id})"
+
+    if isinstance(node, _ast.UnaryOp) and isinstance(node.op, _ast.Not):
+        # 'not X' flips the mode
+        flipped = 'inactive' if mode == 'active' else 'active'
+        return _node_to_jnet(node.operand, flipped, parent_is_boolop=False)
+
+    if isinstance(node, _ast.BoolOp):
+        if mode == 'active':
+            op_str = ' or ' if isinstance(node.op, _ast.Or) else ' and '
+        else:  # De Morgan: swap and ↔ or
+            op_str = ' and ' if isinstance(node.op, _ast.Or) else ' or '
+
+        children = [_node_to_jnet(v, mode, parent_is_boolop=True) for v in node.values]
+        inner = op_str.join(children)
+        # Add parentheses only when nested inside another BoolOp (clarifies precedence)
+        return f"({inner})" if parent_is_boolop else inner
+
+    raise ValueError(f"Unsupported AST node in detector expression: {_ast.dump(node)}")
+
+
+# ── Main demand builder ────────────────────────────────────────────────────────
 
 def build_demand(target: str,
                  from_stage: str,
@@ -37,7 +104,7 @@ def build_demand(target: str,
 
     # ── 1. IsActive for the target detector ──────────────────────────────────
     if target_props and target_props.detector:
-        parts.append(f"IsActive({target_props.detector})")
+        parts.append(_transform_expr(target_props.detector, 'active'))
 
     # ── 2. IsInactive for higher-priority siblings ────────────────────────────
     # Applied regardless of whether the target itself has a detector.
@@ -59,7 +126,7 @@ def build_demand(target: str,
                 key=lambda p: p.sibling_priority
             )
             for sib in siblings:
-                parts.append(f"IsInactive({sib.detector})")
+                parts.append(_transform_expr(sib.detector, 'inactive'))
 
     # ── 3. Waterfall (exactly one level up) ───────────────────────────────────
     target_level = target_props.waterfall_level if target_props else None
@@ -75,7 +142,7 @@ def build_demand(target: str,
                 key=lambda p: (p.sibling_priority or 99)
             )
             for bp in below_stages:
-                inact = f"IsInactive({bp.detector})"
+                inact = _transform_expr(bp.detector, 'inactive')
                 if inact not in parts:
                     parts.append(inact)
 

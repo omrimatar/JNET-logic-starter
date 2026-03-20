@@ -70,45 +70,6 @@ def _find_lrt_current(from_s: str, graph: dict, lrt_anchor: str) -> str | None:
     return non_anchor[0] if non_anchor else lrts[0]
 
 
-def _bypass_wtg_path(from_s: str, lrt_current: str, lrt_anchor: str,
-                     cfg: JunctionConfig, graph: dict) -> str:
-    """
-    Build the AT_less bypass WTG path (everything after 'current_' in the WTG string).
-    - If lrt_current is the LRT Anchor → just '{lrt_anchor}' (no DQ)
-    - If non-anchor entry → '{lrt_current}_DQ_{tail_of_lrt_transition}'
-    """
-    sp = cfg.stage_props
-    va = cfg.vehicle_anchor
-
-    if lrt_current == lrt_anchor:
-        return lrt_anchor  # WTG(current_L39)=false — no DQ
-
-    # Find the transition from_s → lrt_current to get its rest_of_skeleton
-    for t in cfg.transitions:
-        if t.from_stage == from_s and t.to_stage == lrt_current:
-            rest = parse_rest_of_skeleton(t.rest_of_skeleton, sp, va, lrt_anchor)
-            # rest[0] = lrt_current itself → strip it
-            tail = rest[1:] if rest else []
-            tail_s = _tail_str(tail, sp)
-            return f"{lrt_current}_DQ_{tail_s}" if tail_s else f"{lrt_current}_DQ_{va}"
-
-    # Fallback: find the transition lrt_current → first vehicle neighbour
-    vehicle_neighbours = [n for n in graph.get(lrt_current, [])
-                          if not is_lrt(n) and not is_lig(n)]
-    if vehicle_neighbours:
-        first = vehicle_neighbours[0]
-        for t in cfg.transitions:
-            if t.from_stage == lrt_current and t.to_stage == first:
-                rest = parse_rest_of_skeleton(t.rest_of_skeleton, sp, va, lrt_anchor)
-                tail = rest[1:] if rest else []  # strip 'first' itself
-                tail_s = _tail_str(tail, sp)
-                nv_s = apply_suffix(first, sp)
-                if tail_s:
-                    return f"{lrt_current}_DQ_{nv_s}_{tail_s}"
-                return f"{lrt_current}_DQ_{nv_s}_{va}"
-
-    return f"{lrt_current}_DQ_{va}"
-
 
 def _find_next_vehicle_in_skeleton(lrt_stage: str, graph: dict,
                                     cfg: JunctionConfig) -> str:
@@ -163,7 +124,8 @@ def compile_junction(cfg: JunctionConfig) -> list[dict]:
 
         try:
             code = _dispatch(template_letter, from_s, to_s,
-                              tail_stages, graph, cfg)
+                              tail_stages, graph, cfg,
+                              demand_override=trans.demand_override)
         except Exception as e:
             import traceback
             code = f"ERROR: {e} | {traceback.format_exc()}"
@@ -183,14 +145,26 @@ def compile_junction(cfg: JunctionConfig) -> list[dict]:
 
 def _dispatch(template: str, from_s: str, to_s: str,
               tail_stages: list[str],
-              graph: dict, cfg: JunctionConfig) -> str:
+              graph: dict, cfg: JunctionConfig,
+              demand_override: str = '') -> str:
 
     sp = cfg.stage_props
     va = cfg.vehicle_anchor
     la = cfg.lrt_anchor
 
-    gt    = _gt_func(from_s, sp)
-    demand = build_demand(to_s, from_s, sp)
+    gt     = _gt_func(from_s, sp)
+    demand = demand_override.strip() if demand_override.strip() else build_demand(to_s, from_s, sp)
+
+    # ── ProgSwitch / Ghost — junction-wide LRT flags ───────────────────────────
+    # Entering the vehicle anchor requires LRT to be inactive.
+    # Entering the LRT anchor (Template G) requires LRT to be active.
+    # Template C handles ProgSwitch/Ghost inside its own WTG=false arm.
+    if to_s == va:
+        pg = "ProgSwitch=false and Ghost=false"
+        demand = f"{pg} and {demand}" if demand else pg
+    elif to_s == la:
+        pg = "(ProgSwitch=true or Ghost=true)"
+        demand = f"{pg} and {demand}" if demand else pg
 
     # ── Template F ─────────────────────────────────────────────────────────────
     if template == 'F':
@@ -212,19 +186,23 @@ def _dispatch(template: str, from_s: str, to_s: str,
 
         jl_nearest = lrt_to_j(nearest_lrt) if nearest_lrt else 'jL_UNKNOWN'
 
-        # LRT for bypass WTG (AT_less): prefer non-anchor LRT from Current
-        lrt_current = _find_lrt_current(from_s, graph, la)
-        if lrt_current is None:
-            lrt_current = nearest_lrt or la
-
-        bypass = _bypass_wtg_path(from_s, lrt_current, la, cfg, graph)
-
         # Force-move WTG path (after current_)
         tail_s = _tail_str(tail_stages, sp)
         if tail_stages:
             force = f"{at_target}_{tail_s}"
         else:
             force = to_s  # target is LAST → bare, no suffix
+
+        # AT_less bypass WTG: via LRT reachable from Current, then DQ, then
+        # the same target path as force_wtg (NOT the LRT's own rest-of-skeleton).
+        # LRT anchor has no DQ; non-anchor entries get DQ inserted.
+        lrt_current = _find_lrt_current(from_s, graph, la)
+        if lrt_current is None:
+            lrt_current = nearest_lrt or la
+        if lrt_current == la:
+            bypass = la
+        else:
+            bypass = f"{lrt_current}_DQ_{force}"
 
         return template_a(
             current         = from_s,
@@ -266,11 +244,18 @@ def _dispatch(template: str, from_s: str, to_s: str,
 
     # ── Template C — Vehicle → LRT Anchor ─────────────────────────────────────
     if template == 'C':
+        # va_at: vehicle anchor (suffixed, middle element) + nearest LRT from va
+        # Used in the WTG=false arm: AT_less(0, le, current_va_at)
+        nearest_lrt_va = find_nearest_lrt_from_stage(va, graph, la)
+        j_lrt_va = lrt_to_j(nearest_lrt_va) if nearest_lrt_va else lrt_to_j(la)
+        va_at = f"{apply_suffix(va, sp)}_{j_lrt_va}"
+
         return template_c(
             current      = from_s,
             lrt_anchor   = la,
             gt_func      = gt,
             j_lrt_anchor = lrt_to_j(la),
+            va_at        = va_at,
         )
 
     # ── Template D — LRT → Vehicle ────────────────────────────────────────────
@@ -332,7 +317,9 @@ def _dispatch(template: str, from_s: str, to_s: str,
     # ── Template G — LRT → LRT Chaining ───────────────────────────────────────
     if template == 'G':
         jlrt_target  = lrt_to_j(to_s)
-        next_vehicle = _find_next_vehicle_in_skeleton(from_s, graph, cfg)
+        # Use the vehicle that follows the TARGET LRT (to_s), not the current LRT (from_s),
+        # because the WTG/AT_less condition checks feasibility of the target LRT's window.
+        next_vehicle = _find_next_vehicle_in_skeleton(to_s, graph, cfg)
         nv_suffixed  = apply_suffix(next_vehicle, sp)
         nv_at_path   = f"{nv_suffixed}_{jlrt_target}"
 
@@ -341,6 +328,7 @@ def _dispatch(template: str, from_s: str, to_s: str,
             lrt_target   = to_s,
             jlrt_target  = jlrt_target,
             nv_at_path   = nv_at_path,
+            demand       = demand,
         )
 
     raise ValueError(f"Unknown template letter: {template}")

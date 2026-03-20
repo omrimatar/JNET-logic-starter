@@ -28,10 +28,10 @@ def template_a(
     """
     if has_outgoing_lrt:
         at_greater = f"AT_greater(1, ge, {current}_{at_target}_{at_jl}) and EG_{current}=true"
-        at_less    = f"AT_less(1, le, {current}_{at_target}_{at_jl}) and WTG({current}_{bypass_wtg})=false"
+        at_less    = f"AT_less(1, ls, {current}_{at_target}_{at_jl}) and WTG({current}_{bypass_wtg})=false"
     else:
         at_greater = f"EG_{current}=true and AT_greater(1, gt, {current}_{at_target}_{at_jl})"
-        at_less    = f"AT_less(1, le, {current}_{at_target}_{at_jl}) and WTG({current}_{bypass_wtg})=false"
+        at_less    = f"AT_less(1, ls, {current}_{at_target}_{at_jl}) and WTG({current}_{bypass_wtg})=false"
 
     core = (
         f"(PL=0 and EG_{current}=true) "
@@ -70,12 +70,23 @@ def template_c(
     lrt_anchor: str,    # e.g. 'L39'
     gt_func: str,
     j_lrt_anchor: str,  # e.g. 'jL39'
+    va_at: str,         # vehicle_anchor_suffixed_jNearestLRTfromVA, e.g. 'A0min_jL30'
 ) -> str:
-    """Template C: Vehicle → LRT Anchor."""
-    return (
-        f"WTG({current}_{lrt_anchor})=true "
-        f"and (GT({current}) >= {gt_func} and AT_less(0, le, {current}_{j_lrt_anchor}))"
+    """
+    Template C: Vehicle → LRT Anchor.
+    Two OR arms:
+      Forced  — WTG does NOT schedule L39, but must enter it (ProgSwitch/Ghost/timing).
+      Scheduled — WTG schedules L39 normally.
+    """
+    forced = (
+        f"WTG({current}_{lrt_anchor})=false and "
+        f"(ProgSwitch=true or Ghost=true or AT_less(0, le, {current}_{va_at}))"
     )
+    scheduled = (
+        f"WTG({current}_{lrt_anchor})=true and "
+        f"(GT({current}) >= {gt_func} and AT_less(0, le, {current}_{j_lrt_anchor}))"
+    )
+    return f"({forced}) or ({scheduled})"
 
 
 # ── Template D — LRT → Vehicle ────────────────────────────────────────────────
@@ -133,13 +144,18 @@ def template_g(
     current: str,
     lrt_target: str,            # e.g. 'L39'
     jlrt_target: str,           # e.g. 'jL39'
-    nv_at_path: str,            # next_vehicle_suffixed_jlrtTarget, e.g. 'Bcpn_jL39'
+    nv_at_path: str,            # vehicle_after_lrt_target_suffixed_jlrtTarget, e.g. 'A0min_jL39'
+    demand: str = '',
 ) -> str:
     """
     Template G: LRT → LRT chaining.
     No DQ (LRT → LRT, no vehicle entry).
+    nv_at_path uses the vehicle after the TARGET LRT (not the current LRT).
     """
-    return (
+    core = (
         f"(EG_{current}=true and AT_less(0, le, {current}_{jlrt_target})) "
         f"or (WTG({current}_{lrt_target})=true and AT_less(0, ls, {current}_{nv_at_path}))"
     )
+    if demand:
+        return f"{demand} and ({core})"
+    return core

@@ -21,6 +21,7 @@ class Transition:
     from_stage: str
     to_stage: str
     rest_of_skeleton: str   # raw string from file, e.g. 'B-C-A0' or 'end of skeleton'
+    demand_override: str = ''  # if non-empty, replaces auto-computed demand
 
 
 @dataclass
@@ -91,11 +92,12 @@ def parse_excel(file) -> JunctionConfig:
     transitions: list[Transition] = []
 
     for _, row in is_df.iterrows():
-        from_s = _safe_str(row.get('From Stage', ''))
-        to_s   = _safe_str(row.get('To Stage', ''))
-        rest   = _safe_str(row.get('Rest of Skeleton', ''))
+        from_s   = _safe_str(row.get('From Stage', ''))
+        to_s     = _safe_str(row.get('To Stage', ''))
+        rest     = _safe_str(row.get('Rest of Skeleton', ''))
+        override = _safe_str(row.get('Demand Override', ''))
         if from_s and to_s:
-            transitions.append(Transition(from_s, to_s, rest))
+            transitions.append(Transition(from_s, to_s, rest, override))
 
     return JunctionConfig(
         vehicle_anchor  = vehicle_anchor,

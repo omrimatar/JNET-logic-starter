@@ -16,8 +16,9 @@ import streamlit as st
 import pandas as pd
 
 from engine.config import is_lrt, is_lig
-from engine.parser import parse_excel
+from engine.parser import parse_excel, StageProps
 from engine.compiler import compile_junction
+from engine.demand import build_demand
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -176,6 +177,39 @@ def build_output_excel(v_anchor, lrt_anchor, final_skel,
         logic_sheet.set_column(0, 3, 16)   # #, From, To, Template
         logic_sheet.set_column(4, 4, 90)   # JNET Logic Code — wide
     return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEMAND-PREVIEW HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _props_from_df(df: pd.DataFrame) -> dict[str, StageProps]:
+    """Convert the Stage Properties DataFrame into a StageProps dict."""
+    props: dict[str, StageProps] = {}
+    for _, row in df.iterrows():
+        name = str(row.get('Stage', '')).strip()
+        if not name:
+            continue
+        det = str(row.get('Detectors', '')).strip()
+        det = '' if det in ('nan', 'None') else det
+        wl = row.get('Waterfall Level')
+        sp = row.get('Sibling Priority')
+        props[name] = StageProps(
+            name             = name,
+            min_type         = str(row.get('Minimum Type', 'min')).strip() or 'min',
+            detector         = det,
+            waterfall_level  = float(wl) if pd.notna(wl) and wl is not None else None,
+            sibling_priority = float(sp) if pd.notna(sp) and sp is not None else None,
+        )
+    return props
+
+
+def _demand_preview(to_s: str, from_s: str, stage_props: dict) -> str:
+    """Return the auto-computed demand string, or an error marker on failure."""
+    try:
+        return build_demand(to_s, from_s, stage_props)
+    except Exception as exc:
+        return f"⚠ {exc}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -368,14 +402,14 @@ if st.session_state.steps == 4:
 
     # Derive full (From, To, Rest) table from the edited map
     _to_rest_map = dict(zip(edited_to_rest["To Stage"], edited_to_rest["Rest of Skeleton"]))
-    edited_routes = pd.DataFrame([
+    _basic_routes = pd.DataFrame([
         {"From Stage": s_from, "To Stage": s_to,
          "Rest of Skeleton": _to_rest_map.get(s_to, "Check Manually")}
         for s_from, s_to in sorted(st.session_state.transitions)
     ])
 
-    with st.expander(f"Full Inter-Stages table ({len(edited_routes)} rows) — read-only preview"):
-        st.dataframe(edited_routes, use_container_width=True)
+    with st.expander(f"Full Inter-Stages table ({len(_basic_routes)} rows) — read-only preview"):
+        st.dataframe(_basic_routes, use_container_width=True)
 
     st.divider()
 
@@ -383,7 +417,9 @@ if st.session_state.steps == 4:
     st.subheader("Stages Properties")
     st.markdown(
         "Fill in **Detectors**, **Waterfall Level** (0 = highest), and "
-        "**Sibling Priority** (1 = highest) for each vehicle stage."
+        "**Sibling Priority** (1 = highest) for each vehicle stage.  \n"
+        "Detector expressions support boolean syntax: `Pc`, `D6 or D10`, "
+        "`(D2 or Pa) and not Pb`  (case-insensitive AND/OR/NOT)."
     )
     edited_props = st.data_editor(
         st.session_state.df_props,
@@ -394,9 +430,51 @@ if st.session_state.steps == 4:
             "Minimum Type":   st.column_config.SelectboxColumn(
                 options=["min", "cpn", "saf"], default="min", required=True,
             ),
-            "Detectors":      st.column_config.TextColumn(help="e.g.  Pc  or  (D2 or Pa)"),
+            "Detectors":      st.column_config.TextColumn(
+                help="Single: Pc  |  OR: D6 or D10  |  Complex: (D2 or Pa) and not Pb"
+            ),
             "Waterfall Level": st.column_config.NumberColumn(min_value=0, step=1, help="0 = highest"),
             "Sibling Priority": st.column_config.NumberColumn(min_value=1, step=1, help="1 = highest"),
+        },
+    )
+
+    st.divider()
+
+    # ── Demand Override table ─────────────────────────────────────────────────
+    st.subheader("Demand Override  ·  per Transition (optional)")
+    st.markdown(
+        "**Demand Preview** shows the auto-computed demand for each transition "
+        "(updates live as you edit Stage Properties above).  \n"
+        "Fill **Demand Override** only when you want to replace the auto value for "
+        "a specific transition — leave blank to use auto."
+    )
+
+    _stage_props = _props_from_df(edited_props)
+    _demand_rows = [
+        {
+            "From Stage":      s_from,
+            "To Stage":        s_to,
+            "Demand Preview":  _demand_preview(s_to, s_from, _stage_props),
+            "Demand Override": "",
+        }
+        for s_from, s_to in sorted(st.session_state.transitions)
+    ]
+    edited_demand = st.data_editor(
+        pd.DataFrame(_demand_rows),
+        use_container_width=True,
+        num_rows="fixed",
+        key="editor_demand",
+        column_config={
+            "From Stage":      st.column_config.TextColumn(disabled=True),
+            "To Stage":        st.column_config.TextColumn(disabled=True),
+            "Demand Preview":  st.column_config.TextColumn(
+                disabled=True, width="large",
+                help="Auto-computed from Stage Properties. Updates when detectors change.",
+            ),
+            "Demand Override": st.column_config.TextColumn(
+                width="large",
+                help="Leave blank = use auto. Fill to replace the demand for this transition.",
+            ),
         },
     )
 
@@ -416,6 +494,24 @@ if st.session_state.steps == 4:
             )
             st.dataframe(bad, use_container_width=True)
             st.stop()
+
+        # Build override map: (From Stage, To Stage) → override string
+        _override_map = {
+            (row["From Stage"], row["To Stage"]): str(row["Demand Override"]).strip()
+            for _, row in edited_demand.iterrows()
+            if str(row["Demand Override"]).strip()
+        }
+
+        # Merge Rest of Skeleton + Demand Override into the final routes table
+        edited_routes = pd.DataFrame([
+            {
+                "From Stage":      s_from,
+                "To Stage":        s_to,
+                "Rest of Skeleton": _to_rest_map.get(s_to, "Check Manually"),
+                "Demand Override":  _override_map.get((s_from, s_to), ""),
+            }
+            for s_from, s_to in sorted(st.session_state.transitions)
+        ])
 
         try:
             # Build in-memory config Excel → feed directly to engine
