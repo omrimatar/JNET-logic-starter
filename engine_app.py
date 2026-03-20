@@ -180,6 +180,98 @@ def build_output_excel(v_anchor, lrt_anchor, final_skel,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# EXCEL LOAD HELPER  (populate session state from an existing 4-sheet output)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_from_excel(file) -> bool:
+    """
+    Parse an existing 4-sheet JNET output Excel and populate session state.
+    Jumps directly to Step 4 on success.  Returns False on error.
+    """
+    try:
+        xl = pd.ExcelFile(file)
+
+        # ── General Info ──────────────────────────────────────────────────────
+        gi = xl.parse('General Info')
+        gi_map: dict[str, str] = {}
+        for _, row in gi.iterrows():
+            vals = [str(v).strip() for v in row
+                    if str(v).strip() not in ('', 'nan')]
+            if len(vals) >= 2:
+                gi_map[vals[0]] = vals[1]
+
+        v_anchor   = gi_map.get('Vehicle Anchor', '')
+        lrt_anchor = gi_map.get('LRT Anchor', '')
+        skel_str   = gi_map.get('Maximum Skeleton', '')
+        final_skel = [s.strip() for s in skel_str.replace('→', '-').split('-')
+                      if s.strip()]
+
+        # ── Inter-Stages ──────────────────────────────────────────────────────
+        is_df = xl.parse('Inter-Stages').dropna(how='all')
+
+        transitions: list[tuple[str, str]] = []
+        all_stages_set: set[str] = set()
+        for _, row in is_df.iterrows():
+            from_s = str(row.get('From Stage', '')).strip()
+            to_s   = str(row.get('To Stage',   '')).strip()
+            if from_s and to_s and 'nan' not in (from_s, to_s):
+                transitions.append((from_s, to_s))
+                all_stages_set.update([from_s, to_s])
+
+        # Compact To Stage → Rest of Skeleton map (first occurrence wins)
+        to_rest_map: dict[str, str] = {}
+        for _, row in is_df.iterrows():
+            to_s = str(row.get('To Stage', '')).strip()
+            rest = str(row.get('Rest of Skeleton', '')).strip()
+            if to_s and to_s != 'nan' and to_s not in to_rest_map:
+                to_rest_map[to_s] = '' if rest == 'nan' else rest
+
+        df_to_rest = pd.DataFrame([
+            {'To Stage': to, 'Rest of Skeleton': rest}
+            for to, rest in sorted(to_rest_map.items())
+        ])
+
+        # Full routes table (keep Demand Override column if present)
+        keep_cols = ['From Stage', 'To Stage', 'Rest of Skeleton']
+        if 'Demand Override' in is_df.columns:
+            keep_cols.append('Demand Override')
+        df_routes = is_df[keep_cols].copy()
+        df_routes = df_routes[
+            df_routes['From Stage'].astype(str).str.strip()
+            .isin({fs for fs, _ in transitions})
+        ].reset_index(drop=True)
+
+        # ── Stages Properties ─────────────────────────────────────────────────
+        df_props = xl.parse('Stages Properties').dropna(how='all').reset_index(drop=True)
+
+        # ── Source name from filename ──────────────────────────────────────────
+        fname = getattr(file, 'name', 'junction')
+        m = re.search(r"[A-Z]{2}\d{2}", fname)
+        source_name = m.group(0) if m else re.sub(r"[^\w]", "_", fname)
+
+        # ── Populate session state ─────────────────────────────────────────────
+        st.session_state.transitions      = transitions
+        st.session_state.all_stages       = sorted(all_stages_set)
+        st.session_state.v_anchor         = v_anchor
+        st.session_state.lrt_anchor       = lrt_anchor
+        st.session_state.final_skel       = final_skel
+        st.session_state.max_skel_options = [final_skel]
+        st.session_state.df_to_rest       = df_to_rest
+        st.session_state.df_routes        = df_routes
+        st.session_state.df_props         = df_props
+        st.session_state.source_name      = source_name
+        st.session_state.steps            = 4
+        return True
+
+    except Exception as exc:
+        st.error(f"Failed to load Excel: {exc}")
+        with st.expander("Full traceback"):
+            import traceback
+            st.code(traceback.format_exc())
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DEMAND-PREVIEW HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -251,25 +343,47 @@ for k, v in _defaults.items():
         st.session_state[k] = v
 
 
-# ══ STEP 1 — Upload PDFs ══════════════════════════════════════════════════════
+# ══ STEP 1 — Upload Files ══════════════════════════════════════════════════════
 st.header("1 — Upload Files")
-c1, c2 = st.columns(2)
-with c1:
-    inter_file = st.file_uploader("Inter-stages (PDF)", type='pdf')
-with c2:
-    skel_file = st.file_uploader("Skeletons (PDF)", type='pdf')
 
-if inter_file and skel_file and st.session_state.steps == 1:
-    if st.button("Parse Files", type="primary"):
-        with st.spinner("Reading PDFs…"):
-            trans, stages = parse_interstages_pdf(inter_file)
-        st.session_state.transitions = trans
-        st.session_state.all_stages = stages
-        # Derive a junction name from the filename (e.g. NZ04 from NZ04_interstages.pdf)
-        m = re.search(r"[A-Z]{2}\d{2}", inter_file.name)
-        st.session_state.source_name = m.group(0) if m else re.sub(r"[^\w]", "_", inter_file.name)
-        st.session_state.steps = 2
-        st.rerun()
+input_mode = st.radio(
+    "Input method:",
+    ["Build from PDFs", "Load from existing Excel"],
+    horizontal=True,
+    key="input_mode",
+)
+
+if input_mode == "Build from PDFs":
+    c1, c2 = st.columns(2)
+    with c1:
+        inter_file = st.file_uploader("Inter-stages (PDF)", type='pdf')
+    with c2:
+        skel_file = st.file_uploader("Skeletons (PDF)", type='pdf')
+
+    if inter_file and skel_file and st.session_state.steps == 1:
+        if st.button("Parse Files", type="primary"):
+            with st.spinner("Reading PDFs…"):
+                trans, stages = parse_interstages_pdf(inter_file)
+            st.session_state.transitions = trans
+            st.session_state.all_stages = stages
+            m = re.search(r"[A-Z]{2}\d{2}", inter_file.name)
+            st.session_state.source_name = m.group(0) if m else re.sub(r"[^\w]", "_", inter_file.name)
+            st.session_state.steps = 2
+            st.rerun()
+
+else:  # Load from existing Excel
+    st.markdown(
+        "Upload a previously generated **4-sheet JNET output Excel** "
+        "(`General Info · Inter-Stages · Stages Properties · JNET Logic`).  \n"
+        "All configuration will be restored and you can edit or re-compile directly."
+    )
+    xl_file = st.file_uploader("JNET Output Excel", type=['xlsx'], key="xl_upload")
+
+    if xl_file and st.session_state.steps == 1:
+        if st.button("Load Excel", type="primary"):
+            with st.spinner("Loading…"):
+                if _load_from_excel(xl_file):
+                    st.rerun()
 
 
 # ══ STEP 2 — Anchors ══════════════════════════════════════════════════════════
