@@ -1,6 +1,7 @@
 # Keep only the app files — everything else is local reference material
 *
 !.gitignore
+!CLAUDE.md
 !engine_app.py
 !requirements.txt
 !engine/
